@@ -30,3 +30,40 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 231）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+## 实现说明（B 分支）
+
+### 核心实现
+
+`src/main/java/com/example/gsb/WorkStealingScheduler.java`
+
+- 每个工作线程持有一个 `LinkedBlockingDeque<Task>`：
+  - 本地 fork 的任务 `addFirst`，worker 从 **头部** `pollFirst` 取（LIFO，深度优先，缓存局部性好）；
+  - 外部提交按轮询 `addLast` 入队；
+  - 空闲线程从随机起点扫描其它队列，从其 **尾部** `pollLast` 窃取（偷到最老、最可能是大块的工作）。
+- **空闲退让**：本地空 → 扫描所有队列尝试窃取；全部为空时在 `Condition` 上 `awaitNanos`，退避从 1ms 指数增长到 32ms 封顶，有新任务立即 `signalAll` 唤醒，不忙等。
+- **动态扩缩容**：`resize(n)` 直接启动新线程；缩容时标记 `retiring`，worker 在退出前把双端队列中剩余任务逐个转移到存活 worker 的尾部，配合 worker 锁关闭退出竞态，保证未执行任务不丢失。
+- **恰好一次**：任务的取出/窃取均为双端队列的原子操作，无重复执行；用执行计数器与逐任务执行数组（断言每个任务执行次数恰好为 1）验证。
+- **异常隔离**：任务异常被捕获后写入 `TaskFailure(task, error)` 收集队列并异常完成对应 `CompletableFuture`，worker 线程继续服务后续任务。
+- **依赖任务归位**：每个任务记录其 home worker（原始归属队列）。即使任务被窃取执行，它在执行中 fork 的后续任务仍 push 回 **home 队列头部**，单线程下本地后续任务保持 LIFO 顺序，窃取不破坏本地顺序语义。
+- 关闭语义：`shutdown()` / `awaitTermination()` / `close()`，以及 `awaitQuiescence()` 等待所有已提交任务完成。
+
+### 测试
+
+`src/test/java/com/example/gsb/`
+
+- `WorkStealingSchedulerTest`：窃取正确性（任务确实被空闲线程从尾部偷走）、随机任务图 5000 任务不重不漏、动态扩容/缩容、缩容后被移除 worker 待执行任务不丢失、异常隔离与失败收集、被窃取任务的后续回到 home worker 执行、本地 fork LIFO 顺序、空闲线程 park 不忙等。
+- `LoadComparisonTest`：4 worker、25 轮，每轮 1 个 25ms 重任务 + 3 个 1ms 轻任务，固定轮询分配会把所有重任务压到同一 worker；工作窃取下空闲 worker 偷走重任务（实测每次 18 个重任务被窃取）。
+
+### 负载对比数据（本机实测）
+
+| 方案 | 完成时间 | 加速比 |
+|------|----------|--------|
+| 固定轮询分配 | ~650 ms | 1.00x |
+| 工作窃取 | ~180 ms | **~3.6x** |
+
+### 运行
+
+```bash
+mvn -q verify
+```
